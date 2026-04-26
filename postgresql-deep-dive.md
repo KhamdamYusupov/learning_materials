@@ -270,6 +270,7 @@ AND (xmax is 0
 
 `S.xip_list` is the set of transactions in progress at snapshot time. Reads: "I see you if you were committed before my snapshot, and I don't see deletions made by transactions still running when my snapshot was taken."
 
+
 ### 2.5 Snapshot Isolation
 
 A *snapshot* records:
