@@ -380,7 +380,10 @@ flowchart TD
 **Reading:** callers POST to one API. It checks the idempotency key (no double-send) and user preferences (respect opt-outs/quiet hours) *before* enqueuing — filtering early saves work. Notifications land on priority queues (transactional OTPs jump ahead of marketing blasts). Channel-specific workers pull from the queue and call the relevant third-party provider, recording status. Providers report final delivery asynchronously via webhooks back into a status updater. The queue is what absorbs broadcast spikes and isolates provider slowness from callers.
 
 ## 8. Deep Dive Components
-- **Priority queues:** separate lanes so a 10M-user marketing broadcast can't delay a password-reset OTP. Transactional > marketing.
+
+The whole design is really one instinct repeated: *never let the bulk, boring traffic get in the way of the urgent, important traffic.* A marketing blast is huge but nobody's waiting on it; a password-reset code is tiny but someone is staring at their screen waiting for it. The four pieces below are all ways of protecting the second from the first.
+
+- **Priority queues:** separate lanes so a 10M-user marketing broadcast can't delay a password-reset OTP. Think of it like an airport: there's a first-class lane and an economy lane feeding the same gate, so a planeload of economy passengers can't trap the urgent traveler behind them. Transactional > marketing.
 - **Fan-out for broadcasts:** "notify all users" is enqueued as a *job*, then expanded into per-user messages by fan-out workers (don't materialize 10M rows synchronously).
 - **Provider abstraction + failover:** wrap each provider behind an interface; if SendGrid fails, fail over to SES. Circuit-break unhealthy providers.
 - **Retry with backoff + DLQ:** transient provider failures retry with exponential backoff; permanent failures (invalid address) go to a dead-letter queue, not infinite retry.
@@ -646,7 +649,10 @@ flowchart LR
 **Reading:** apps write logs locally; lightweight agents batch and ship them into **Kafka**, which absorbs bursts and decouples producers from the slower indexing pipeline (so a slow search cluster never backs up into the apps). Ingest workers parse/enrich and write recent logs to a **hot** searchable store (Elasticsearch) and stream everything to **cold** cheap storage (S3). Engineers query the hot store for recent debugging; old data is rehydrated from cold on demand. The Kafka buffer + hot/cold split is the cost-and-resilience backbone.
 
 ## 8. Deep Dive Components
-- **Async, non-blocking agents:** apps write to a local buffer/file; agents ship asynchronously. If logging backs up, apps *drop* logs rather than block — observability must never cause an outage.
+
+The golden rule running through all of this: **logging is a passenger, never the driver.** The system that's *producing* logs (your actual app serving real users) must never slow down or crash because the system that *collects* logs is having a bad day. Every decision below flows from that — and from the brutal reality that at scale you simply cannot afford to keep every log forever.
+
+- **Async, non-blocking agents:** apps write to a local buffer/file; agents ship asynchronously. The app's job is to scribble a line and immediately get back to serving the user — like dropping a letter in a mailbox and walking away, not standing at the post office waiting for it to arrive. If logging backs up, apps *drop* logs rather than block — observability must never cause an outage.
 - **Tiered retention:** hot (7 days, searchable, expensive) → warm → cold (S3/Glacier, cheap, slow). Auto-expire by policy.
 - **Sampling:** at extreme volume, sample high-frequency debug logs; never sample errors/audit.
 - **Compression + columnar/inverted indexing** for storage and search efficiency.
@@ -1522,7 +1528,10 @@ flowchart TD
 **Reading:** the order service requests a reservation; inventory does an **atomic conditional decrement** (`UPDATE ... SET available = available - qty WHERE sku=? AND available >= qty`) — the `available >= qty` guard is what prevents overselling, since the DB serializes concurrent updates to that row and rejects the ones that would go negative. Every change is recorded in an append-only **movement log** for audit/reconciliation. Inventory emits events so the warehouse and analytics react. The atomic guarded decrement is the whole correctness story.
 
 ## 8. Deep Dive Components
-- **Atomic guarded decrement:** the conditional `WHERE available >= qty` (or optimistic version check + retry) is the core anti-oversell mechanism. Pessimistic row lock vs optimistic retry — both work; optimistic scales better under moderate contention.
+
+Everything in inventory orbits one question: *how do you let thousands of people grab from the same pile of stock without ever handing out the same unit twice?* Keep that in mind and the four pieces below click into place — the first one is the safety latch, the next two are how you make that latch fast and flexible, and the last one is your paper trail.
+
+- **Atomic guarded decrement:** the conditional `WHERE available >= qty` (or optimistic version check + retry) is the core anti-oversell mechanism. Picture two shoppers reaching for the last item at the same millisecond: the database physically can't apply both updates at once, so it lines them up — the first one turns `available` from 1 to 0, and the second one's `available >= qty` check now fails, so it bounces with "zero rows updated" instead of dragging the count to -1. That single `WHERE` clause is doing the job a bouncer does at a sold-out door. Pessimistic row lock vs optimistic retry — both work; optimistic scales better under moderate contention.
 - **Reserve vs commit (two-phase):** reserve stock when order is placed (hold), commit on fulfillment, release on cancel/timeout — mirrors the booking hold pattern. Decouples "ordered" from "shipped."
 - **Hot-SKU contention:** for extreme flash sales, *partition the count* into N sub-buckets (`available_1..available_N`), decrement a random bucket, sum for total — spreads contention across rows (like hot-key splitting).
 - **Event sourcing via movement log:** stock = sum of movements; gives audit trail and reconciliation.
